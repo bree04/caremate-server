@@ -1,6 +1,7 @@
 """
 CareMate FastAPI 서버 (통합본)
-- Ollama (exaone3.5:7.8b) 연동
+- Ollama chat: exaone3.5:7.8b (대화)
+- Ollama ocr:  exaone3.5:7.8b (약품명 추출 - 정확도 우선)
 - 의약품 CSV → SQLite 검색
 - RAG (Chroma DB 벡터 검색) 연동
 - 대화 기억 (chat_history)
@@ -46,6 +47,9 @@ app.add_middleware(
 DB_PATH = "caremate_server.db"
 CSV_PATH = "medicines_preprocessed.csv"
 OCR_API_KEY = "K88624131688957"
+
+CHAT_MODEL = "exaone3.5:7.8b"
+OCR_MODEL = "exaone3.5:7.8b"  # 정확도 위해 exaone 사용
 
 SYSTEM_PROMPT = """당신은 어르신을 돌봐드리는 다정한 디지털 식물 '새싹이'입니다.
 규칙:
@@ -234,6 +238,22 @@ def delete_file(path: str):
         print(f"파일 삭제 실패: {e}")
 
 
+# ── 환각 방지: OCR 원문에 실제로 존재하는 약품명만 통과 ──────────────────────
+def validate_medicine_names(ai_names: list, ocr_text: str) -> list:
+    """AI가 추출한 약품명이 실제 OCR 원문에 있는지 검증"""
+    validated = []
+    for name in ai_names:
+        # 앞 4글자 이상 일치 확인 (OCR 오류 감안)
+        check_len = min(4, len(name))
+        short = name[:check_len]
+        if short in ocr_text:
+            validated.append(name)
+            print(f"✅ 검증 통과: {name}")
+        else:
+            print(f"⚠️ 환각 감지, 제외: {name} ('{short}'이 원문에 없음)")
+    return validated if validated else ai_names  # 전부 탈락하면 원본 유지
+
+
 # ── Pydantic 모델 ─────────────────────────────────────────────────────────────
 
 class ChatRequest(BaseModel):
@@ -272,7 +292,7 @@ def health():
     return {"status": "ok"}
 
 
-# ── 챗봇 ──────────────────────────────────────────────────────────────────────
+# ── 챗봇 ─────────────────────────────────────────────────────────────────────
 
 @app.post("/chat")
 async def chat(req: ChatRequest):
@@ -281,7 +301,7 @@ async def chat(req: ChatRequest):
     history = get_recent_history(req.user_id)
     try:
         response = ollama.chat(
-            model="exaone3.5:7.8b",
+            model=CHAT_MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT + med_context},
                 *history,
@@ -319,7 +339,7 @@ async def tts(req: TTSRequest, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=500, detail=f"TTS 실패: {e}")
 
 
-# ── OCR ───────────────────────────────────────────────────────────────────────
+# ── OCR 스캔 ──────────────────────────────────────────────────────────────────
 
 @app.post("/ocr/scan")
 async def ocr_scan(req: OCRScanRequest):
@@ -344,35 +364,56 @@ async def ocr_scan(req: OCRScanRequest):
             return {'text': ''}
         parsed = result.get('ParsedResults', [])
         text = parsed[0].get('ParsedText', '') if parsed else ''
-        print(f"OCR 원문: {text[:100]}...")
+        print(f"OCR 완료: {len(text)}자")
         return {'text': text}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"OCR 실패: {e}")
 
 
+# ── OCR 약품명 추출 (환각 방지 강화) ─────────────────────────────────────────
+
 @app.post("/ocr/extract")
 async def ocr_extract(req: OCRExtractRequest):
-    prompt = f"""다음은 약 봉투 OCR 텍스트입니다.
-약품명만 골라서 JSON으로 반환하세요.
-약국명, 날짜, 금액, 주의사항, 복약안내, 색상, 보관방법은 제외하세요.
-반드시 JSON만 반환하고 다른 설명은 하지 마세요.
-형식: {{"medicines": ["약품명1", "약품명2", "약품명3"]}}
+    """OCR 원문 → AI가 약품명 추출 → 환각 검증 → DB 매칭"""
 
-OCR 텍스트:
+    # ✅ 강화된 프롬프트: 원문에 없는 약 절대 추가 금지
+    prompt = f"""아래는 약 봉투 OCR 텍스트입니다. 약품명만 추출하세요.
+
+[절대 규칙]
+1. 반드시 아래 텍스트에 실제로 존재하는 단어만 추출하세요.
+2. 텍스트에 없는 약품명을 절대 만들어내지 마세요.
+3. 약국명, 날짜, 금액, 주의사항, 색상, 보관방법은 제외하세요.
+4. JSON 형식으로만 반환하세요. 다른 설명 금지.
+
+[출력 형식]
+{{"medicines": ["약품명1", "약품명2"]}}
+
+[OCR 텍스트]
 {req.ocr_text}"""
+
     try:
         response = ollama.chat(
-            model="exaone3.5:7.8b",
+            model=OCR_MODEL,
             messages=[{"role": "user", "content": prompt}]
         )
         content = response["message"]["content"]
+        print(f"AI 응답: {content}")
+
         match = re.search(r'\{.*\}', content, re.DOTALL)
         if not match:
             return {"medicines": [], "matched": []}
+
         extracted = json.loads(match.group())
         ai_names = extracted.get("medicines", [])
+        print(f"AI 추출 약품명 (검증 전): {ai_names}")
+
+        # ✅ 환각 검증: OCR 원문에 실제로 있는 약품명만 통과
+        ai_names = validate_medicine_names(ai_names, req.ocr_text)
+        print(f"AI 추출 약품명 (검증 후): {ai_names}")
+
         matched = []
         for name in ai_names:
+            # 앞 4글자로 DB 퍼지 검색
             short = name[:4] if len(name) >= 4 else name
             results = search_medicine_by_name(short)
             if results:
@@ -388,7 +429,9 @@ OCR 텍스트:
                     "shape": "", "color1": "", "color2": "",
                     "otc_type": "", "original": name, "db_matched": False,
                 })
+
         return {"medicines": ai_names, "matched": matched}
+
     except Exception as e:
         print(f"OCR 추출 오류: {e}")
         return {"medicines": [], "matched": [], "error": str(e)}
@@ -490,4 +533,5 @@ def get_history(user_id: str, limit: int = 20):
 def startup():
     init_db()
     import_csv_to_db()
-    print("CareMate 통합 서버 시작! (chat + TTS + OCR + 약품DB)")
+    print(f"CareMate 통합 서버 시작!")
+    print(f"  대화/OCR 모델: {CHAT_MODEL}")
